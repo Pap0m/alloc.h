@@ -18,72 +18,130 @@ typedef enum {
   RED,
 } Color;
 
-typedef struct {
-  void *base;
-} Mem;
+typedef struct Header_Alloc Header_Alloc;
 
-typedef struct Free_Mem Free_Mem;
-
-struct Free_Mem {
+struct Header_Alloc {
   Color color;
   void *data;
   size_t size;
-  // int is_free;
+  int is_free;
 
-  Free_Mem *parent, *left, *right;
+  Header_Alloc *parent, *left, *right;
 };
 
-// declarations
-Free_Mem *mem_alloc(size_t size);
-// int mem_push(Mem* mem);
-// int mem_pull(Mem* mem);
-
-// implementation
+typedef struct {
+  size_t size;
+  int is_free;
+} Footer_Alloc;
 
 // API public functions
-Free_Mem *mem_alloc(size_t size);
-void tree_insert(Free_Mem **root, int data);
-void tree_delete(Free_Mem **root, int data);
-Free_Mem *tree_search(Free_Mem *root, int data);
-void tree_destroy(Free_Mem *root);
-void tree_print(Free_Mem *root);
+void *mem_alloc(size_t size);
+void mem_free(void *ptr);
+void tree_insert(Header_Alloc **root, Header_Alloc *z);
+void tree_delete(Header_Alloc **root, Header_Alloc *z);
+Header_Alloc *tree_search(Header_Alloc *root, size_t req_mem);
+void tree_destroy(Header_Alloc *root);
+void tree_print(Header_Alloc *root);
 // tree_insert helper functions
-void insert_fixup(Free_Mem **root, Free_Mem *z);
-void left_rotate(Free_Mem **root, Free_Mem *x);
-void right_rotate(Free_Mem **root, Free_Mem *y);
+void insert_fixup(Header_Alloc **root, Header_Alloc *z);
+void left_rotate(Header_Alloc **root, Header_Alloc *x);
+void right_rotate(Header_Alloc **root, Header_Alloc *y);
 // tree_delete helper functions
-void delete_fixup(Free_Mem **root, Free_Mem *x, Free_Mem *x_parent);
-void transplant(Free_Mem **root, Free_Mem *u, Free_Mem *v);
-Free_Mem *tree_min(Free_Mem *node);
-Free_Mem *tree_max(Free_Mem *node);
-Color get_color(Free_Mem *node);
+void delete_fixup(Header_Alloc **root, Header_Alloc *x, Header_Alloc *x_parent);
+void transplant(Header_Alloc **root, Header_Alloc *u, Header_Alloc *v);
+Header_Alloc *tree_min(Header_Alloc *node);
+Header_Alloc *tree_max(Header_Alloc *node);
+Color get_color(Header_Alloc *node);
 
 #endif // ALLOC_H_
 
 #ifdef ALLOC_IMPLEMENTATION
 
+static Header_Alloc *FREE_MEM_ROOT = NULL;
+
+size_t align_to_16(size_t size) { return (val + 15) & ~15; }
+
 // API public functions
-Free_Mem *mem_alloc(size_t size) {
-  Free_Mem *node = {0};
-  void *base = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (base == MAP_FAILED) {
-    perror("Error mmap");
-    exit(EXIT_FAILURE);
+void *mem_alloc(size_t req_size) {
+  if (req_size <= 0)
+    return NULL;
+
+  size_t total_mem = req_size + sizeof(Header_Alloc) + sizeof(Fotter_Alloc);
+  total_mem = align_to_16(total_mem);
+
+  if (FREE_MEM_ROOT == NULL) {
+    void *mem_region = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem_region == MAP_FAILED) {
+      perror("Error mmap");
+      exit(EXIT_FAILURE);
+    }
+    Header_Alloc *header = (Header_Alloc *)mem_region;
+
+    header->data = header;
+    header->size = PAGE_SIZE;
+    header->is_free = 1;
+
+    Footer_Alloc *footer =
+        (Footer_Alloc *)((char *)header + header->size - sizeof(Footer_Alloc));
+
+    footer->size = header->size;
+    footer->is_free = header->is_free;
+
+    tree_insert(&FREE_MEM_ROOT, header);
   }
-  Free_Mem *free_mem = (Free_Mem *)base;
 
-  free_mem->data = base;
+  else {
+    Header_Alloc *allocated_header = tree_search(&FREE_MEM_ROOT, total_mem);
+    if (!allocated_header) {
+      // TODO: Handle if there is no best fit node
+    }
+    tree_detree_delete(&FREE_MEM_ROOT, allocated_header);
 
-  return free_mem;
+    if (allocated_header->size == total_mem->size)
+      return (void *)(allocated_header + 1);
+
+    allocated_header->size = total_mem;
+    allocated_header->is_free = 0;
+
+    Footer_Alloc *allocated_footer =
+        (Footer_Alloc *)((char *)allocated_header + allocated_header->size +
+                         sizeof(Footer_Alloc));
+    allocated_footer->size = allocated_header->size;
+    allocated_footer->is_free = allocated_header->is_free;
+
+    Header_Alloc *remainder_header =
+        (Header_Alloc *)((char *)allocated_header + allocated_header->size);
+    remainder_header->size = original_total_size - found_node->size;
+    remainder_header->is_free = 1;
+
+    Footer_Alloc *remainder_footer =
+        (Footer_Alloc *)((char *)remainder_header + remainder_header->size +
+                         sizeof(Footer_Alloc));
+    remainder_footer->size = remainder_header->size;
+    remainder_footer->is_free = remainder_header->is_free;
+  }
+
+  return (void *)(header + 1);
 }
 
-void tree_insert(Free_Mem **root, int data) {
+void mem_free(void *ptr) {
+  if (!ptr)
+    return;
+
+  Header_Alloc *header = (Header_Alloc *)ptr - 1;
+  header->is_free = 1;
+
+  // TODO: Merge stuff
+
+  treetree_insert(&FREE_MEM_ROOT, header);
+}
+
+void tree_insert(Header_Alloc **root, Header_Alloc *z) {
   if (root == NULL)
     return;
 
-  // alloc new Free_Mem
-  Free_Mem *z = malloc(sizeof(Free_Mem));
+  // alloc new Header_Alloc
   z->color = RED;
   z->data = data;
   z->parent = NULL;
@@ -97,27 +155,25 @@ void tree_insert(Free_Mem **root, int data) {
     return;
   }
 
-  Free_Mem *parent = NULL;
-  Free_Mem *current = *root;
+  Header_Alloc *parent = NULL;
+  Header_Alloc *current = *root;
 
   while (current != NULL) {
     parent = current;
     // go to the left
-    if (data < parent->data) {
+    if (z->size < parent->size) {
       current = current->left;
     }
     // go to the right
-    else if (data > parent->data) {
+    else if (z->size > parent->size) {
       current = current->right;
       // data exist
     } else {
-      free(z);
-      return;
     }
   }
 
   z->parent = parent;
-  if (data < parent->data) {
+  if (size < parent->size) {
     parent->left = z;
   } else {
     parent->right = z;
@@ -129,7 +185,7 @@ void tree_insert(Free_Mem **root, int data) {
   return;
 }
 
-void tree_delete(Free_Mem **root, int data) {
+void tree_delete(Header_Alloc **root, Header_Alloc *z) {
   if (root == NULL)
     return;
 
@@ -138,7 +194,6 @@ void tree_delete(Free_Mem **root, int data) {
     return;
 
   // find the node to delete
-  Free_Mem *z = *root;
   while (z != NULL && z->data != data) {
     if (data < z->data)
       z = z->left;
@@ -149,9 +204,9 @@ void tree_delete(Free_Mem **root, int data) {
   if (z == NULL)
     return; // data not found
 
-  Free_Mem *y = z;
-  Free_Mem *x = NULL;
-  Free_Mem *x_parent = NULL; // used because 'x' might be NULL
+  Header_Alloc *y = z;
+  Header_Alloc *x = NULL;
+  Header_Alloc *x_parent = NULL; // used because 'x' might be NULL
   Color y_original_color = y->color;
 
   // Case 1: No left child
@@ -195,25 +250,23 @@ void tree_delete(Free_Mem **root, int data) {
   }
 }
 
-Free_Mem *tree_search(Free_Mem *root, int data) {
+Header_Alloc *tree_search(Header_Alloc *root, size_t req_mem) {
   if (root == NULL)
     return NULL;
 
-  // find the node
-  Free_Mem *current = root;
-  while (current != NULL && current->data != data) {
-    if (data < current->data)
-      current = current->left;
-    else
-      current = current->right;
+  // find the block size that fits
+  Header_Alloc *best_fit = root;
+  while (current != NULL && current->size != req_mem) {
+    if (req_mem >= best_fit->size)
+      best_fit = best_fit->left;
   }
 
-  if (current == NULL)
-    return NULL; // data not found
-  return current;
+  if (best_fit == NULL)
+    return NULL; // block size not found
+  return best_fit;
 }
 
-void tree_destroy(Free_Mem *root) {
+void tree_destroy(Header_Alloc *root) {
   if (root != NULL) {
     tree_destroy(root->left);
     tree_destroy(root->right);
@@ -221,7 +274,7 @@ void tree_destroy(Free_Mem *root) {
   }
 }
 
-void tree_print(Free_Mem *root) {
+void tree_print(Header_Alloc *root) {
   if (root != NULL) {
     tree_print(root->left);
     printf("%d ", root->data);
@@ -229,13 +282,13 @@ void tree_print(Free_Mem *root) {
   }
 }
 
-void insert_fixup(Free_Mem **root, Free_Mem *z) {
+void insert_fixup(Header_Alloc **root, Header_Alloc *z) {
   // fix if the parent_node is red
   while (z->parent != NULL && z->parent->color == RED) {
-    Free_Mem *g = z->parent->parent;
+    Header_Alloc *g = z->parent->parent;
 
     if (z->parent == g->left) {
-      Free_Mem *u = g->right;
+      Header_Alloc *u = g->right;
 
       // Case 1: The uncle is red (recoloring)
       if (u != NULL && u->color == RED) {
@@ -257,7 +310,7 @@ void insert_fixup(Free_Mem **root, Free_Mem *z) {
         right_rotate(root, g);
       }
     } else {
-      Free_Mem *u = g->left;
+      Header_Alloc *u = g->left;
 
       // Case 1: The uncle is red (recoloring)
       if (u != NULL && u->color == RED) {
@@ -284,8 +337,8 @@ void insert_fixup(Free_Mem **root, Free_Mem *z) {
   return;
 }
 
-void left_rotate(Free_Mem **root, Free_Mem *x) {
-  Free_Mem *y = x->right;
+void left_rotate(Header_Alloc **root, Header_Alloc *x) {
+  Header_Alloc *y = x->right;
   x->right = y->left;
 
   if (y->left != NULL) {
@@ -306,8 +359,8 @@ void left_rotate(Free_Mem **root, Free_Mem *x) {
   return;
 }
 
-void right_rotate(Free_Mem **root, Free_Mem *y) {
-  Free_Mem *x = y->left;
+void right_rotate(Header_Alloc **root, Header_Alloc *y) {
+  Header_Alloc *x = y->left;
   y->left = x->right;
 
   if (x->right != NULL) {
@@ -328,8 +381,9 @@ void right_rotate(Free_Mem **root, Free_Mem *y) {
   return;
 }
 
-void delete_fixup(Free_Mem **root, Free_Mem *x, Free_Mem *x_parent) {
-  Free_Mem *w = NULL;
+void delete_fixup(Header_Alloc **root, Header_Alloc *x,
+                  Header_Alloc *x_parent) {
+  Header_Alloc *w = NULL;
 
   // while x is not root and x is black
   while (x != *root && get_color(x) == BLACK) {
@@ -421,7 +475,7 @@ void delete_fixup(Free_Mem **root, Free_Mem *x, Free_Mem *x_parent) {
   }
 }
 
-void transplant(Free_Mem **root, Free_Mem *u, Free_Mem *v) {
+void transplant(Header_Alloc **root, Header_Alloc *u, Header_Alloc *v) {
   if (u->parent == NULL) {
     *root = v;
   } else if (u == u->parent->left) {
@@ -435,20 +489,22 @@ void transplant(Free_Mem **root, Free_Mem *u, Free_Mem *v) {
   }
 }
 
-Free_Mem *tree_min(Free_Mem *node) {
+Header_Alloc *tree_min(Header_Alloc *node) {
   while (node->left != NULL) {
     node = node->left;
   }
   return node;
 }
 
-Free_Mem *tree_max(Free_Mem *node) {
+Header_Alloc *tree_max(Header_Alloc *node) {
   while (node->right != NULL) {
     node = node->right;
   }
   return node;
 }
 
-Color get_color(Free_Mem *node) { return (node == NULL) ? BLACK : node->color; }
+Color get_color(Header_Alloc *node) {
+  return (node == NULL) ? BLACK : node->color;
+}
 
 #endif // ALLOC_IMPLEMENTATION
