@@ -71,9 +71,9 @@ void *mem_alloc(size_t req_size) {
   total_mem = align_to_16(total_mem);
 
   if (FREE_MEM_ROOT == NULL) {
-    // TODO: Map a region large enough to hold total_mem if total_mem >
-    // PAGE_SIZE
-    void *mem_region = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
+    size_t map_size = (total_mem + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    void *mem_region = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem_region == MAP_FAILED) {
       perror("Error mmap");
@@ -82,8 +82,9 @@ void *mem_alloc(size_t req_size) {
     Header_Alloc *header = (Header_Alloc *)mem_region;
 
     header->data = header;
-    header->size = PAGE_SIZE;
+    header->size = map_size;
     header->is_free = 1;
+    header->next_same_size = NULL;
 
     Footer_Alloc *footer =
         (Footer_Alloc *)((char *)header + header->size - sizeof(Footer_Alloc));
@@ -94,7 +95,7 @@ void *mem_alloc(size_t req_size) {
     tree_insert(&FREE_MEM_ROOT, header);
   }
 
-  Header_Alloc *allocated_header = tree_search(&FREE_MEM_ROOT, total_mem);
+  Header_Alloc *allocated_header = tree_search(FREE_MEM_ROOT, total_mem);
   if (!allocated_header) {
     // TODO: Handle if there is no best fit node (e.g., extend heap via mmap)
     return NULL;
