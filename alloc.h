@@ -18,22 +18,33 @@ typedef enum {
 } Color;
 
 typedef struct Header_Alloc Header_Alloc;
+typedef struct Footer_Alloc Footer_Alloc;
+typedef struct Arena Arena;
 
 struct Header_Alloc {
   Color color;
   void *data;
+  // size = Header_Alloc + data + Footer_Alloc
   size_t size;
   int is_free;
 
   Header_Alloc *parent, *left, *right;
 
   Header_Alloc *next_same_size;
+  Header_Alloc *prev_same_size;
 };
 
-typedef struct {
+struct Footer_Alloc {
   size_t size;
   int is_free;
-} Footer_Alloc;
+};
+
+// track mmap regions to properly munmap them later
+struct Arena {
+  void *start;
+  size_t length;
+  Arena *next;
+};
 
 // API public functions
 void *mem_alloc(size_t size);
@@ -41,12 +52,14 @@ void mem_free(void *ptr);
 void tree_insert(Header_Alloc **root, Header_Alloc *z);
 void tree_delete(Header_Alloc **root, Header_Alloc *z);
 Header_Alloc *tree_search(Header_Alloc *root, size_t req_mem);
-void tree_destroy(Header_Alloc *root);
+void free_all(void);
 void tree_print(Header_Alloc *root);
+
 // tree_insert helper functions
 void insert_fixup(Header_Alloc **root, Header_Alloc *z);
 void left_rotate(Header_Alloc **root, Header_Alloc *x);
 void right_rotate(Header_Alloc **root, Header_Alloc *y);
+
 // tree_delete helper functions
 void delete_fixup(Header_Alloc **root, Header_Alloc *x, Header_Alloc *x_parent);
 void transplant(Header_Alloc **root, Header_Alloc *u, Header_Alloc *v);
@@ -54,13 +67,53 @@ Header_Alloc *tree_min(Header_Alloc *node);
 Header_Alloc *tree_max(Header_Alloc *node);
 Color get_color(Header_Alloc *node);
 
+// linked list and exact delete funcion
+void tree_exact_delete(Header_Alloc **root, Header_Alloc *target);
+
 #endif // ALLOC_H_
 
 #ifdef ALLOC_IMPLEMENTATION
 
 static Header_Alloc *FREE_MEM_ROOT = NULL;
+static Arena *ARENA_HEAD = NULL;
 
 static inline size_t align_to_16(size_t size) { return (size + 15) & ~15; }
+
+// helper to expand heap dynamically
+static void *extend_heap(size_t total_mem) {
+  size_t required_mem = total_mem + sizeof(Arena);
+  size_t map_size = (required_mem + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+  void *mem_region = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mem_region == MAP_FAILED) {
+    perror("Error mmap");
+    exit(EXIT_FAILURE);
+  }
+
+  // track the Arena
+  Arena *arena = (Arena *)mem_region;
+  arena->start = mem_region;
+  arena->length = map_size;
+  arena->next = ARENA_HEAD;
+  ARENA_HEAD = arena;
+
+  // Setup the header just after the Arena struct
+  Header_Alloc *header = (Header_Alloc *)((char *)mem_region + sizeof(Arena));
+  header->data = header;
+  header->size = map_size - sizeof(Arena);
+  header->is_free = 1;
+  header->next_same_size = NULL;
+  header->prev_same_size = NULL;
+
+  Footer_Alloc *footer =
+      (Footer_Alloc *)((char *)header + header->size - sizeof(Footer_Alloc));
+  footer->size = header->size;
+  footer->is_free = header->is_free;
+
+  tree_insert(&FREE_MEM_ROOT, header);
+  return header;
+}
 
 // API public functions
 void *mem_alloc(size_t req_size) {
@@ -71,68 +124,57 @@ void *mem_alloc(size_t req_size) {
   total_mem = align_to_16(total_mem);
 
   if (FREE_MEM_ROOT == NULL) {
-    size_t map_size = (total_mem + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-
-    void *mem_region = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mem_region == MAP_FAILED) {
-      perror("Error mmap");
+    if (!extend_heap(total_mem))
       exit(EXIT_FAILURE);
-    }
-    Header_Alloc *header = (Header_Alloc *)mem_region;
-
-    header->data = header;
-    header->size = map_size;
-    header->is_free = 1;
-    header->next_same_size = NULL;
-
-    Footer_Alloc *footer =
-        (Footer_Alloc *)((char *)header + header->size - sizeof(Footer_Alloc));
-
-    footer->size = header->size;
-    footer->is_free = header->is_free;
-
-    tree_insert(&FREE_MEM_ROOT, header);
   }
 
   Header_Alloc *allocated_header = tree_search(FREE_MEM_ROOT, total_mem);
   if (!allocated_header) {
-    // TODO: Handle if there is no best fit node (e.g., extend heap via mmap)
-    return NULL;
+    if (!extend_heap(total_mem))
+      return NULL;
+    allocated_header = tree_search(FREE_MEM_ROOT, total_mem);
   }
 
-  // TODO: check linked list (next_same_size) before deleting the found node
-  // to avoid deleting the tree structure if there are duplicates of the same
-  // size.
-  tree_delete(&FREE_MEM_ROOT, allocated_header);
+  if (allocated_header->next_same_size != NULL) {
+    Header_Alloc *dup = allocated_header->next_same_size;
+    allocated_header->next_same_size = dup->next_same_size;
+    if (dup->next_same_size) {
+      dup->next_same_size->prev_same_size = (Header_Alloc *)allocated_header;
+    }
+    dup->is_free = 0;
+    allocated_header = dup; // Use the duplicate, leave tree intact
+  } else {
+    tree_exact_delete(&FREE_MEM_ROOT, allocated_header);
+  }
 
-  allocated_header->size = total_mem;
   allocated_header->is_free = 0;
 
-  // return immediately if the found node size is equal to the requested size
-  if (allocated_header->size == total_mem)
+  size_t min_split_size =
+      align_to_16(sizeof(Header_Alloc) + sizeof(Footer_Alloc));
+  if (allocated_header->size - total_mem < min_split_size) {
+    // Do not split, allocate entire block
     return (void *)(allocated_header + 1);
+  }
 
-  // TODO: Ensure the remainder is actually large enough to hold a Header_Alloc
-  // + Footer_Alloc before splitting. If it's too small, just allocate the whole
-  // block to the user.
-
+  // split the block
   Footer_Alloc *allocated_footer =
-      (Footer_Alloc *)((char *)allocated_header + allocated_header->size +
+      (Footer_Alloc *)((char *)allocated_header + total_mem -
                        sizeof(Footer_Alloc));
-  allocated_footer->size = allocated_header->size;
-  allocated_footer->is_free = allocated_header->is_free;
+  allocated_footer->size = total_mem;
+  allocated_footer->is_free = 0;
 
   Header_Alloc *remainder_header =
-      (Header_Alloc *)((char *)allocated_header + allocated_header->size);
-  remainder_header->size = total_mem - allocated_header->size;
+      (Header_Alloc *)((char *)allocated_header + total_mem);
+  remainder_header->size = allocated_header->size - total_mem;
   remainder_header->is_free = 1;
 
   Footer_Alloc *remainder_footer =
-      (Footer_Alloc *)((char *)remainder_header + remainder_header->size +
+      (Footer_Alloc *)((char *)remainder_header + remainder_header->size -
                        sizeof(Footer_Alloc));
   remainder_footer->size = remainder_header->size;
   remainder_footer->is_free = remainder_header->is_free;
+
+  allocated_header->size = total_mem;
 
   tree_insert(&FREE_MEM_ROOT, remainder_header);
 
@@ -140,30 +182,95 @@ void *mem_alloc(size_t req_size) {
 }
 
 void mem_free(void *ptr) {
-  if (!ptr)
+  if (ptr == NULL)
     return;
 
-  Header_Alloc *header = (Header_Alloc *)ptr - 1;
-  header->is_free = 1;
+  Header_Alloc *h_ptr = ((Header_Alloc *)ptr - 1);
+  h_ptr->is_free = 1;
 
-  // TODO: Merge stuff (Coalesce physical adjacent left/right memory blocks
-  // using Footers/Headers)
-  // TODO: Remove adjacent nodes from tree before inserting the newly merged
-  // block.
+  // look right
+  Header_Alloc *h_next = (Header_Alloc *)((char *)h_ptr + h_ptr->size);
+  if (h_next->is_free == 1) {
+    tree_exact_delete(&FREE_MEM_ROOT, h_next);
+    h_ptr->size += h_next->size;
+  }
 
-  tree_insert(&FREE_MEM_ROOT, header);
+  // look left
+  Footer_Alloc *f_prev = (Footer_Alloc *)((char *)h_ptr - sizeof(Footer_Alloc));
+  if (f_prev->is_free == 1) {
+    Header_Alloc *h_prev = (Header_Alloc *)((char *)h_ptr - f_prev->size);
+    tree_exact_delete(&FREE_MEM_ROOT, h_prev);
+    h_prev->size += h_ptr->size;
+    h_ptr = h_prev;
+    // shift focus to the left block
+  }
+
+  // update footer
+  Footer_Alloc *f_ptr =
+      (Footer_Alloc *)((char *)h_ptr + h_ptr->size - sizeof(Footer_Alloc));
+  f_ptr->size = h_ptr->size;
+  f_ptr->is_free = 1;
+
+  tree_insert(&FREE_MEM_ROOT, h_ptr);
+
+  return;
+}
+
+void tree_exact_delete(Header_Alloc **root, Header_Alloc *target) {
+  if (root == NULL || *root == NULL || target == NULL)
+    return;
+
+  // Case A: target is in linked list, but is not the tree head
+  if (target->prev_same_size != NULL) {
+    target->prev_same_size->next_same_size = target->next_same_size;
+    if (target->next_same_size) {
+      target->next_same_size->prev_same_size = target->prev_same_size;
+    }
+    return;
+  }
+
+  // Case B: target is the tree head, but has duplicates
+  // swap it
+  if (target->next_same_size != NULL) {
+    Header_Alloc *replacement = target->next_same_size;
+    replacement->prev_same_size = NULL; // it's the new head
+
+    // Inherit tree topology
+    replacement->color = target->color;
+    replacement->parent = target->parent;
+    replacement->left = target->left;
+    replacement->right = target->right;
+
+    if (target->parent == NULL) {
+      *root = replacement;
+    } else if (target == target->parent->left) {
+      target->parent->left = replacement;
+    } else {
+      target->parent->right = replacement;
+    }
+
+    if (target->left)
+      target->left->parent = replacement;
+    if (target->right)
+      target->right->parent = replacement;
+
+    return;
+  }
+
+  // Case C: normal tree node with no duplicates
+  tree_delete(root, target);
 }
 
 void tree_insert(Header_Alloc **root, Header_Alloc *z) {
   if (root == NULL || z == NULL)
     return;
 
-  // alloc new Header_Alloc
   z->color = RED;
   z->parent = NULL;
   z->left = NULL;
   z->right = NULL;
-  // TODO: Initialize z->next_same_size appropriately
+  z->next_same_size = NULL;
+  z->prev_same_size = NULL;
 
   // empty tree case
   if (*root == NULL) {
@@ -185,11 +292,13 @@ void tree_insert(Header_Alloc **root, Header_Alloc *z) {
     else if (z->size > parent->size) {
       current = current->right;
     } else {
-      // TODO: Handle inserting 'z' properly into the linked list instead of
-      // just overwriting. E.g., z->next_same_size = current->next_same_size;
-      // current->next_same_size = z;
+      z->next_same_size = current->next_same_size;
+      if (current->next_same_size) {
+        current->next_same_size->prev_same_size = z;
+      }
       current->next_same_size = z;
-      return;
+      z->prev_same_size = current;
+      return; // not alter tree topology
     }
   }
 
@@ -207,16 +316,8 @@ void tree_insert(Header_Alloc **root, Header_Alloc *z) {
 }
 
 void tree_delete(Header_Alloc **root, Header_Alloc *z) {
-  if (root == NULL || z == NULL)
+  if (root == NULL || *root == NULL || z == NULL)
     return;
-
-  // empty tree case
-  if (*root == NULL)
-    return;
-
-  // TODO: Implement logic to handle deleting a node that acts as a head for
-  // `next_same_size`. If `z->next_same_size != NULL`, swap it into `z`'s
-  // position without modifying tree topology.
 
   Header_Alloc *y = z;
   Header_Alloc *x = NULL;
@@ -256,8 +357,6 @@ void tree_delete(Header_Alloc **root, Header_Alloc *z) {
     y->color = z->color;
   }
 
-  // TODO: Decide if we should scrub the memory content of z, or clear pointers.
-
   // fix up if we lost a BLACK node
   if (y_original_color == BLACK) {
     delete_fixup(root, x, x_parent);
@@ -283,14 +382,16 @@ Header_Alloc *tree_search(Header_Alloc *root, size_t req_mem) {
   return best_fit;
 }
 
-void tree_destroy(Header_Alloc *root) {
-  if (root != NULL) {
-    tree_destroy(root->left);
-    tree_destroy(root->right);
-    // TODO: Use munmap() instead of libc free() to release allocated pages back
-    // to the OS. Ensure you track total original mapped page boundaries
-    // properly. free(root);
+void free_all(void) {
+  Arena *current = ARENA_HEAD;
+  while (current != NULL) {
+    Arena *next = current->next;
+    munmap(current->start, current->length);
+    current = next;
   }
+
+  ARENA_HEAD = NULL;
+  FREE_MEM_ROOT = NULL;
 }
 
 void tree_print(Header_Alloc *root) {
