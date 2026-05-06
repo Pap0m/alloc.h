@@ -27,6 +27,8 @@ struct Header_Alloc {
   int is_free;
 
   Header_Alloc *parent, *left, *right;
+
+  Header_Alloc *next_same_size;
 };
 
 typedef struct {
@@ -59,14 +61,14 @@ Color get_color(Header_Alloc *node);
 
 static Header_Alloc *FREE_MEM_ROOT = NULL;
 
-size_t align_to_16(size_t size) { return (val + 15) & ~15; }
+static inline size_t align_to_16(size_t size) { return (size + 15) & ~15; }
 
 // API public functions
 void *mem_alloc(size_t req_size) {
   if (req_size <= 0)
     return NULL;
 
-  size_t total_mem = req_size + sizeof(Header_Alloc) + sizeof(Fotter_Alloc);
+  size_t total_mem = req_size + sizeof(Header_Alloc) + sizeof(Footer_Alloc);
   total_mem = align_to_16(total_mem);
 
   if (FREE_MEM_ROOT == NULL) {
@@ -91,38 +93,40 @@ void *mem_alloc(size_t req_size) {
     tree_insert(&FREE_MEM_ROOT, header);
   }
 
-  else {
-    Header_Alloc *allocated_header = tree_search(&FREE_MEM_ROOT, total_mem);
-    if (!allocated_header) {
-      // TODO: Handle if there is no best fit node
-    }
-    tree_delete(&FREE_MEM_ROOT, allocated_header);
-
-    if (allocated_header->size == total_mem->size)
-      return (void *)(allocated_header + 1);
-
-    allocated_header->size = total_mem;
-    allocated_header->is_free = 0;
-
-    Footer_Alloc *allocated_footer =
-        (Footer_Alloc *)((char *)allocated_header + allocated_header->size +
-                         sizeof(Footer_Alloc));
-    allocated_footer->size = allocated_header->size;
-    allocated_footer->is_free = allocated_header->is_free;
-
-    Header_Alloc *remainder_header =
-        (Header_Alloc *)((char *)allocated_header + allocated_header->size);
-    remainder_header->size = original_total_size - found_node->size;
-    remainder_header->is_free = 1;
-
-    Footer_Alloc *remainder_footer =
-        (Footer_Alloc *)((char *)remainder_header + remainder_header->size +
-                         sizeof(Footer_Alloc));
-    remainder_footer->size = remainder_header->size;
-    remainder_footer->is_free = remainder_header->is_free;
+  Header_Alloc *allocated_header = tree_search(&FREE_MEM_ROOT, total_mem);
+  if (!allocated_header) {
+    // TODO: Handle if there is no best fit node
   }
+  // TODO: check linked list before delete the found node
+  tree_delete(&FREE_MEM_ROOT, allocated_header);
 
-  return (void *)(header + 1);
+  allocated_header->size = total_mem;
+  allocated_header->is_free = 0;
+
+  // return immediately if the found node size is equal to the requested size
+  if (allocated_header->size == total_mem)
+    return (void *)(allocated_header + 1);
+
+  Footer_Alloc *allocated_footer =
+      (Footer_Alloc *)((char *)allocated_header + allocated_header->size +
+                       sizeof(Footer_Alloc));
+  allocated_footer->size = allocated_header->size;
+  allocated_footer->is_free = allocated_header->is_free;
+
+  Header_Alloc *remainder_header =
+      (Header_Alloc *)((char *)allocated_header + allocated_header->size);
+  remainder_header->size = total_mem - allocated_header->size;
+  remainder_header->is_free = 1;
+
+  Footer_Alloc *remainder_footer =
+      (Footer_Alloc *)((char *)remainder_header + remainder_header->size +
+                       sizeof(Footer_Alloc));
+  remainder_footer->size = remainder_header->size;
+  remainder_footer->is_free = remainder_header->is_free;
+
+  tree_insert(&FREE_MEM_ROOT, remainder_header);
+
+  return (void *)(allocated_header + 1);
 }
 
 void mem_free(void *ptr) {
@@ -169,6 +173,9 @@ void tree_insert(Header_Alloc **root, Header_Alloc *z) {
       current = current->right;
       // data exist
     } else {
+      // add it into the linked list
+      current->next_same_size = z;
+      return;
     }
   }
 
@@ -242,7 +249,7 @@ void tree_delete(Header_Alloc **root, Header_Alloc *z) {
     y->color = z->color;
   }
 
-  free(z);
+  // TODO: Free z
 
   // fix up if we lost a BLACK node
   if (y_original_color == BLACK) {
@@ -254,15 +261,18 @@ Header_Alloc *tree_search(Header_Alloc *root, size_t req_mem) {
   if (root == NULL)
     return NULL;
 
-  // find the block size that fits
-  Header_Alloc *best_fit = root;
-  while (current != NULL && current->size != req_mem) {
-    if (req_mem >= best_fit->size)
-      best_fit = best_fit->left;
+  Header_Alloc best_fit = NULL;
+  Header_Alloc *current = root;
+
+  while (current != NULL) {
+    if (current->size >= req_mem) {
+      best_fit = current;
+      current = current->left;
+    } else {
+      current = current->left;
+    }
   }
 
-  if (best_fit == NULL)
-    return NULL; // block size not found
   return best_fit;
 }
 
@@ -405,8 +415,8 @@ void delete_fixup(Header_Alloc **root, Header_Alloc *x,
         x = x_parent; // move up
         x_parent = x->parent;
       } else {
-        // Case 3: sibling is BLACK and sibling's right child is BLACK but left
-        // must be RED
+        // Case 3: sibling is BLACK and sibling's right child is BLACK but
+        // left must be RED
         if (get_color(w->right) == BLACK) {
           if (w->left != NULL)
             w->left->color = BLACK;
@@ -445,8 +455,8 @@ void delete_fixup(Header_Alloc **root, Header_Alloc *x,
         x = x_parent; // move up
         x_parent = x->parent;
       } else {
-        // Case 3: sibling is BLACK and sibling's left child is BLACK but right
-        // must be RED
+        // Case 3: sibling is BLACK and sibling's left child is BLACK but
+        // right must be RED
         if (get_color(w->left) == BLACK) {
           if (w->right != NULL)
             w->right->color = BLACK;
