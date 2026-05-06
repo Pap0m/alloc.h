@@ -96,7 +96,7 @@ void *mem_alloc(size_t req_size) {
     if (!allocated_header) {
       // TODO: Handle if there is no best fit node
     }
-    tree_detree_delete(&FREE_MEM_ROOT, allocated_header);
+    tree_delete(&FREE_MEM_ROOT, allocated_header);
 
     if (allocated_header->size == total_mem->size)
       return (void *)(allocated_header + 1);
@@ -134,7 +134,7 @@ void mem_free(void *ptr) {
 
   // TODO: Merge stuff
 
-  treetree_insert(&FREE_MEM_ROOT, header);
+  tree_insert(&FREE_MEM_ROOT, header);
 }
 
 void tree_insert(Header_Alloc **root, Header_Alloc *z) {
