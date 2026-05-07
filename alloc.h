@@ -141,7 +141,15 @@ void *mem_alloc(size_t req_size) {
     if (dup->next_same_size) {
       dup->next_same_size->prev_same_size = (Header_Alloc *)allocated_header;
     }
+    dup->prev_same_size = NULL;
+    dup->next_same_size = NULL;
     dup->is_free = 0;
+
+    // Mark the footer not-free so left-coalesce won't absorb it
+    Footer_Alloc *dup_footer =
+        (Footer_Alloc *)((char *)dup + dup->size - sizeof(Footer_Alloc));
+    dup_footer->is_free = 0;
+
     allocated_header = dup; // Use the duplicate, leave tree intact
   } else {
     tree_exact_delete(&FREE_MEM_ROOT, allocated_header);
@@ -181,6 +189,16 @@ void *mem_alloc(size_t req_size) {
   return (void *)(allocated_header + 1);
 }
 
+static Arena *arena_of(void *ptr) {
+  for (Arena *a = ARENA_HEAD; a != NULL; a = a->next) {
+    char *lo = (char *)a->start;
+    char *hi = lo + a->length;
+    if ((char *)ptr >= lo && (char *)ptr < hi)
+      return a;
+  }
+  return NULL;
+}
+
 void mem_free(void *ptr) {
   if (ptr == NULL)
     return;
@@ -188,21 +206,28 @@ void mem_free(void *ptr) {
   Header_Alloc *h_ptr = ((Header_Alloc *)ptr - 1);
   h_ptr->is_free = 1;
 
-  // look right
+  Arena *arena = arena_of(h_ptr);
+  char *arena_h_start = arena ? (char *)arena->start + sizeof(Arena) : NULL;
+  char *arena_end = arena ? (char *)arena->start + arena->length : NULL;
+
+  // look right only if the next block is still inside the same arena
   Header_Alloc *h_next = (Header_Alloc *)((char *)h_ptr + h_ptr->size);
-  if (h_next->is_free == 1) {
-    tree_exact_delete(&FREE_MEM_ROOT, h_next);
-    h_ptr->size += h_next->size;
+  if (arena_end && (char *)h_next + sizeof(Header_Alloc) <= arena_end) {
+    if (h_next->is_free == 1) {
+      tree_exact_delete(&FREE_MEM_ROOT, h_next);
+      h_ptr->size += h_next->size;
+    }
   }
 
-  // look left
+  // look left only if there is a footer before us inside the same arena
   Footer_Alloc *f_prev = (Footer_Alloc *)((char *)h_ptr - sizeof(Footer_Alloc));
-  if (f_prev->is_free == 1) {
-    Header_Alloc *h_prev = (Header_Alloc *)((char *)h_ptr - f_prev->size);
-    tree_exact_delete(&FREE_MEM_ROOT, h_prev);
-    h_prev->size += h_ptr->size;
-    h_ptr = h_prev;
-    // shift focus to the left block
+  if (arena_h_start && (char *)f_prev >= arena_h_start) {
+    if (f_prev->is_free == 1) {
+      Header_Alloc *h_prev = (Header_Alloc *)((char *)h_ptr - f_prev->size);
+      tree_exact_delete(&FREE_MEM_ROOT, h_prev);
+      h_prev->size += h_ptr->size;
+      h_ptr = h_prev; // shift focus to the left block
+    }
   }
 
   // update footer
@@ -234,6 +259,7 @@ void tree_exact_delete(Header_Alloc **root, Header_Alloc *target) {
   if (target->next_same_size != NULL) {
     Header_Alloc *replacement = target->next_same_size;
     replacement->prev_same_size = NULL; // it's the new head
+    // replacement->next_same_size already points to the rest of the chain
 
     // Inherit tree topology
     replacement->color = target->color;
