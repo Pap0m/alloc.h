@@ -7,10 +7,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+
+static inline size_t get_page_size(void) {
+  SYSTEM_INFO si;
+  GetSystemInfo(&si);
+  return (size_t)si.dwPageSize;
+}
+#define PAGE_SIZE get_page_size()
+
+#else
 #include <sys/mman.h>
 #include <unistd.h>
 
 #define PAGE_SIZE sysconf(_SC_PAGESIZE)
+#endif
 
 typedef enum {
   BLACK,
@@ -84,12 +97,23 @@ static void *extend_heap(size_t total_mem) {
   size_t required_mem = total_mem + sizeof(Arena);
   size_t map_size = (required_mem + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
-  void *mem_region = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (mem_region == MAP_FAILED) {
-    perror("Error mmap");
+  void *mem_region;
+
+#ifdef _WIN32
+  mem_region =
+      VirtualAlloc(NULL, map_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if (mem_region == NULL) {
+    fprintf(stderr, "Failed VirtualAlloc failed\n");
     exit(EXIT_FAILURE);
   }
+#else
+  mem_region = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mem_region == MAP_FAILED) {
+    perror("Failed mmap");
+    exit(EXIT_FAILURE);
+  }
+#endif
 
   // track the Arena
   Arena *arena = (Arena *)mem_region;
@@ -412,7 +436,13 @@ void free_all(void) {
   Arena *current = ARENA_HEAD;
   while (current != NULL) {
     Arena *next = current->next;
+#ifdef _WIN32
+    // Windows VirtualFree requires size to be 0 when using MEM_RELEASE
+    VirtualFree(current->start, 0, MEM_RELEASE);
+#else
     munmap(current->start, current->length);
+#endif
+
     current = next;
   }
 
