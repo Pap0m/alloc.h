@@ -22,7 +22,7 @@ static inline size_t get_page_size(void) {
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define PAGE_SIZE sysconf(_SC_PAGESIZE)
+#define PAGE_SIZE (size_t)sysconf(_SC_PAGESIZE)
 #endif
 
 typedef enum {
@@ -61,6 +61,7 @@ struct Arena {
 
 // API public functions
 void *mem_alloc(size_t size);
+void *mem_realloc(void *ptr, size_t req_size);
 void mem_free(void *ptr);
 void tree_insert(Header_Alloc **root, Header_Alloc *z);
 void tree_delete(Header_Alloc **root, Header_Alloc *z);
@@ -90,7 +91,9 @@ void tree_exact_delete(Header_Alloc **root, Header_Alloc *target);
 static Header_Alloc *FREE_MEM_ROOT = NULL;
 static Arena *ARENA_HEAD = NULL;
 
-static inline size_t align_to_16(size_t size) { return (size + 15) & ~15; }
+static inline size_t align_to_16(size_t size) {
+  return (size + 15) & ~(size_t)15;
+}
 
 // helper to expand heap dynamically
 static void *extend_heap(size_t total_mem) {
@@ -137,6 +140,16 @@ static void *extend_heap(size_t total_mem) {
 
   tree_insert(&FREE_MEM_ROOT, header);
   return header;
+}
+
+static Arena *arena_of(void *ptr) {
+  for (Arena *a = ARENA_HEAD; a != NULL; a = a->next) {
+    char *lo = (char *)a->start;
+    char *hi = lo + a->length;
+    if ((char *)ptr >= lo && (char *)ptr < hi)
+      return a;
+  }
+  return NULL;
 }
 
 // API public functions
@@ -213,14 +226,117 @@ void *mem_alloc(size_t req_size) {
   return (void *)(allocated_header + 1);
 }
 
-static Arena *arena_of(void *ptr) {
-  for (Arena *a = ARENA_HEAD; a != NULL; a = a->next) {
-    char *lo = (char *)a->start;
-    char *hi = lo + a->length;
-    if ((char *)ptr >= lo && (char *)ptr < hi)
-      return a;
+void *mem_realloc(void *ptr, size_t req_size) {
+  if (ptr == NULL) {
+    return mem_alloc(req_size);
   }
-  return NULL;
+  if (req_size <= 0) {
+    mem_free(ptr);
+    return NULL;
+  }
+
+  // Retrieve the current header
+  Header_Alloc *h_ptr = (Header_Alloc *)ptr - 1;
+
+  // calculate the new total required size (including header/footer and
+  // alignment)
+  size_t total_mem = req_size + sizeof(Header_Alloc) + sizeof(Footer_Alloc);
+  total_mem = align_to_16(total_mem);
+  size_t min_split_size =
+      align_to_16(sizeof(Header_Alloc) + sizeof(Footer_Alloc));
+
+  // shrinking or exact fit
+  if (h_ptr->size >= total_mem) {
+    // Can we split the block to free up the remainder?
+    if (h_ptr->size - total_mem >= min_split_size) {
+      size_t original_size = h_ptr->size;
+      h_ptr->size = total_mem;
+
+      // update current block footer
+      Footer_Alloc *new_f =
+          (Footer_Alloc *)((char *)h_ptr + total_mem - sizeof(Footer_Alloc));
+      new_f->size = total_mem;
+      new_f->is_free = 0;
+
+      // create remainder block
+      Header_Alloc *rem_h = (Header_Alloc *)((char *)h_ptr + total_mem);
+      rem_h->size = original_size - total_mem;
+      rem_h->is_free = 1;
+
+      Footer_Alloc *rem_f =
+          (Footer_Alloc *)((char *)rem_h + rem_h->size - sizeof(Footer_Alloc));
+      rem_f->size = rem_h->size;
+      rem_f->is_free = 1;
+
+      // insert remainder into the Red-Black free tree
+      tree_insert(&FREE_MEM_ROOT, rem_h);
+    }
+    return ptr;
+  }
+
+  // expanding (Try In-Place Expansion)
+  Arena *arena = arena_of(h_ptr);
+  char *arena_end = arena ? (char *)arena->start + arena->length : NULL;
+  Header_Alloc *next_h = (Header_Alloc *)((char *)h_ptr + h_ptr->size);
+
+  // verify the next block is safely within the arena bounds and is free
+  if (arena_end && (char *)next_h + sizeof(Header_Alloc) <= arena_end &&
+      next_h->is_free == 1) {
+
+    // check if current block + next free block is large enough
+    if (h_ptr->size + next_h->size >= total_mem) {
+
+      // remove the adjacent free block from the free tree
+      tree_exact_delete(&FREE_MEM_ROOT, next_h);
+      size_t combined_size = h_ptr->size + next_h->size;
+
+      // can we split the newly combined block?
+      if (combined_size - total_mem >= min_split_size) {
+        h_ptr->size = total_mem;
+
+        // update current block footer
+        Footer_Alloc *new_f =
+            (Footer_Alloc *)((char *)h_ptr + total_mem - sizeof(Footer_Alloc));
+        new_f->size = total_mem;
+        new_f->is_free = 0;
+
+        // create remainder block
+        Header_Alloc *rem_h = (Header_Alloc *)((char *)h_ptr + total_mem);
+        rem_h->size = combined_size - total_mem;
+        rem_h->is_free = 1;
+
+        Footer_Alloc *rem_f = (Footer_Alloc *)((char *)rem_h + rem_h->size -
+                                               sizeof(Footer_Alloc));
+        rem_f->size = rem_h->size;
+        rem_f->is_free = 1;
+
+        tree_insert(&FREE_MEM_ROOT, rem_h);
+      } else {
+        // take the entire combined block
+        h_ptr->size = combined_size;
+        Footer_Alloc *new_f = (Footer_Alloc *)((char *)h_ptr + combined_size -
+                                               sizeof(Footer_Alloc));
+        new_f->size = combined_size;
+        new_f->is_free = 0;
+      }
+      return ptr; // successfully expanded without moving data
+    }
+  }
+
+  // expanding (Fallback to Allocate -> Copy -> Free)
+  void *new_ptr = mem_alloc(req_size);
+  if (!new_ptr) {
+    return NULL; // allocation failed, original block is left untouched
+  }
+
+  // only copy the available data from the old block
+  size_t old_data_size =
+      h_ptr->size - sizeof(Header_Alloc) - sizeof(Footer_Alloc);
+  memcpy(new_ptr, ptr, old_data_size);
+
+  mem_free(ptr);
+
+  return new_ptr;
 }
 
 void mem_free(void *ptr) {
